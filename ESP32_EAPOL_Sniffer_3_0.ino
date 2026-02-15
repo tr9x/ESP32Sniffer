@@ -597,6 +597,52 @@ void handleTouch() {
     delay(200);
 }
 
+// ===== ANIMACJA STARTOWA =====
+void showBootAnimation() {
+    tft.fillScreen(COLOR_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(4);
+
+    String text = "Z3r[0x30]";
+    int charWidth = 18; // Przybliżona szerokość znaku dla fontu 4
+    int startX = 160 - (text.length() * charWidth) / 2 + (charWidth / 2);
+    int finalY = 100;
+
+    // Efekt składania (spadające znaki)
+    for (int i = 0; i < text.length(); i++) {
+        String c = String(text[i]);
+        int xPos = startX + (i * charWidth);
+
+        // Animacja pojedynczego znaku
+        for (int y = -20; y <= finalY; y += 20) {
+            if (y > -20) {
+                tft.setTextColor(COLOR_BG); // Zamazanie poprzedniej klatki
+                tft.drawString(c, xPos, y - 20);
+            }
+            tft.setTextColor(COLOR_SELECTED); // Zielony podczas lotu
+            tft.drawString(c, xPos, y);
+            delay(15);
+        }
+
+        // Docelowy kolor (czerwone nawiasy, biała reszta)
+        if (c == "[" || c == "]") {
+            tft.setTextColor(0xF800); // Czerwony
+        } else {
+            tft.setTextColor(COLOR_TEXT); // Biały
+        }
+        tft.drawString(c, xPos, finalY);
+        delay(80); // Przerwa przed kolejnym znakiem
+    }
+
+    // Krótkie mignięcie i dopisek
+    delay(200);
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_SELECTED);
+    tft.drawString("Wczytywanie modulow...", 160, 150);
+
+    delay(1500); // Czas na podziwianie animacji
+    tft.fillScreen(COLOR_BG); // Czyszczenie ekranu pod główny program
+}
 // ===== SETUP =====
 void setup() {
     Serial.begin(115200);
@@ -615,6 +661,8 @@ void setup() {
     tft.setRotation(1);
     tft.fillScreen(COLOR_BG);
     Serial.println("   ✓ TFT OK\n");
+
+    showBootAnimation();
 
     // ===== KROK 2: TOUCH =====
     Serial.println("2. Inicjalizacja Touch...");
