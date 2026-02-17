@@ -269,7 +269,17 @@ void drawCaptureScreen() {
 
         tft.setTextColor(COLOR_TEXT);
         tft.drawString("Ch:" + String(networks[selectedNetwork].channel), 10, y, 2);
-        y += 25;
+        y += 20;
+
+        tft.setTextColor(COLOR_TEXT);
+        tft.drawString("BSSID:", 10, y, 2);
+        char bssidStr[20];
+        uint8_t* b = networks[selectedNetwork].bssid;
+        sprintf(bssidStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+                b[0], b[1], b[2], b[3], b[4], b[5]);
+        tft.setTextColor(COLOR_SELECTED);
+        tft.drawString(String(bssidStr), 70, y, 2);
+        y += 20;
     }
 
     tft.drawString("Pakiety: " + String(packetCounter), 10, y, 2);
