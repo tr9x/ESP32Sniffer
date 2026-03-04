@@ -202,7 +202,7 @@ bool initCapFile() {
     hdr.thiszone = 0;
     hdr.sigfigs = 0;
     hdr.snaplen = 65535;
-    hdr.network = 105;
+    hdr.network = 127;
 
     size_t written = capFile.write((uint8_t*)&hdr, sizeof(pcap_hdr_t));
     Serial.println("Zapisano bajtów nagłówka: " + String(written));
@@ -269,17 +269,7 @@ void drawCaptureScreen() {
 
         tft.setTextColor(COLOR_TEXT);
         tft.drawString("Ch:" + String(networks[selectedNetwork].channel), 10, y, 2);
-        y += 20;
-
-        tft.setTextColor(COLOR_TEXT);
-        tft.drawString("BSSID:", 10, y, 2);
-        char bssidStr[20];
-        uint8_t* b = networks[selectedNetwork].bssid;
-        sprintf(bssidStr, "%02X:%02X:%02X:%02X:%02X:%02X",
-                b[0], b[1], b[2], b[3], b[4], b[5]);
-        tft.setTextColor(COLOR_SELECTED);
-        tft.drawString(String(bssidStr), 70, y, 2);
-        y += 20;
+        y += 25;
     }
 
     tft.drawString("Pakiety: " + String(packetCounter), 10, y, 2);
@@ -404,20 +394,82 @@ bool isEAPOLFrame(uint8_t* payload, uint16_t len) {
         return false;
 }
 
+// ===== CRC-32 DLA FCS (IEEE 802.11) =====
+uint32_t IRAM_ATTR crc32_ieee80211(const uint8_t* data, uint16_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320;
+            else crc >>= 1;
+        }
+    }
+    return ~crc;
+}
+
 // ===== CALLBACK SNIFFER =====
 void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (currentState != STATE_CAPTURE) return;
-    if (type != WIFI_PKT_DATA) return;
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
 
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
     uint8_t* payload = pkt->payload;
     uint16_t len = pkt->rx_ctrl.sig_len;
-    if (len < 24 || len > 2346) return;
+    // sig_len zawiera 4 bajty FCS – odejmujemy, by uzyskać czystą ramkę 802.11
+    uint16_t frame_len = (len > 4) ? (len - 4) : len;
+    if (frame_len < 24 || frame_len > 2346) return;
 
     packetCounter++;
 
+    // --- Management frames: ESSID, Beacon, Probe Response itp. ---
+    if (type == WIFI_PKT_MGMT) {
+        // W ramkach zarządzania BSSID zawsze leży w addr3 (offset 16)
+        if (selectedNetwork >= 0 && !matchesBSSID(payload + 16)) {
+            bssidFilteredOut++;
+            return;
+        }
+        if (capFile && sdCardAvailable) {
+            // Budujemy nagłówek Radiotap (15 bajtów, present: Flags|Rate|Channel|dBm)
+            uint8_t rtap[15] = {0};
+            rtap[2] = 15;                               // it_len = 15
+            rtap[4] = 0x2E;                             // it_present: bity 1,2,3,5
+            rtap[9] = (uint8_t)pkt->rx_ctrl.rate;       // Rate (jednostki 500 kbps)
+            uint16_t freq = (pkt->rx_ctrl.channel == 14) ? 2484
+            : (pkt->rx_ctrl.channel <= 13) ? 2407 + pkt->rx_ctrl.channel * 5
+            : 5000 + pkt->rx_ctrl.channel * 5;
+            rtap[10] = freq & 0xFF; rtap[11] = (freq >> 8) & 0xFF;
+            uint16_t chfl = (pkt->rx_ctrl.channel <= 14) ? 0x00A0 : 0x0140;
+            rtap[12] = chfl & 0xFF; rtap[13] = (chfl >> 8) & 0xFF;
+            rtap[14] = (uint8_t)pkt->rx_ctrl.rssi;      // dBm Signal
+
+            // Obliczamy FCS (CRC-32) z czystej ramki i dołączamy
+            uint32_t fcs = crc32_ieee80211(payload, frame_len);
+            uint32_t total_len = sizeof(rtap) + frame_len + 4;
+
+            pcaprec_hdr_t pkthdr;
+            pkthdr.ts_sec = millis() / 1000;
+            pkthdr.ts_usec = (millis() % 1000) * 1000;
+            pkthdr.incl_len = total_len;
+            pkthdr.orig_len = total_len;
+
+            capFile.write((uint8_t*)&pkthdr, sizeof(pcaprec_hdr_t));
+            capFile.write(rtap, sizeof(rtap));
+            capFile.write(payload, frame_len);
+            capFile.write((uint8_t*)&fcs, 4);
+            capFile.flush();
+        }
+        if (DEBUG_MODE) {
+            Serial.print(">>> MGMT | Subtype: 0x");
+            Serial.print((payload[0] >> 4) & 0x0F, HEX);
+            Serial.print(" | Len: ");
+            Serial.println(frame_len);
+        }
+        return;
+    }
+
+    // --- Data frames: filtrowanie po BSSID i wykrywanie EAPOL ---
     uint8_t bssid[6];
-    if (!extractBSSID(payload, len, bssid)) {
+    if (!extractBSSID(payload, frame_len, bssid)) {
         return;
     }
 
@@ -426,17 +478,36 @@ void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) 
         return;
     }
 
-    if (isEAPOLFrame(payload, len)) {
+    if (isEAPOLFrame(payload, frame_len)) {
         eapolCounter++;
         if (capFile && sdCardAvailable) {
+            // Budujemy nagłówek Radiotap (15 bajtów, present: Flags|Rate|Channel|dBm)
+            uint8_t rtap[15] = {0};
+            rtap[2] = 15;                               // it_len = 15
+            rtap[4] = 0x2E;                             // it_present: bity 1,2,3,5
+            rtap[9] = (uint8_t)pkt->rx_ctrl.rate;       // Rate (jednostki 500 kbps)
+            uint16_t freq = (pkt->rx_ctrl.channel == 14) ? 2484
+            : (pkt->rx_ctrl.channel <= 13) ? 2407 + pkt->rx_ctrl.channel * 5
+            : 5000 + pkt->rx_ctrl.channel * 5;
+            rtap[10] = freq & 0xFF; rtap[11] = (freq >> 8) & 0xFF;
+            uint16_t chfl = (pkt->rx_ctrl.channel <= 14) ? 0x00A0 : 0x0140;
+            rtap[12] = chfl & 0xFF; rtap[13] = (chfl >> 8) & 0xFF;
+            rtap[14] = (uint8_t)pkt->rx_ctrl.rssi;      // dBm Signal
+
+            // Obliczamy FCS (CRC-32) z czystej ramki i dołączamy
+            uint32_t fcs = crc32_ieee80211(payload, frame_len);
+            uint32_t total_len = sizeof(rtap) + frame_len + 4;
+
             pcaprec_hdr_t pkthdr;
             pkthdr.ts_sec = millis() / 1000;
             pkthdr.ts_usec = (millis() % 1000) * 1000;
-            pkthdr.incl_len = len;
-            pkthdr.orig_len = len;
+            pkthdr.incl_len = total_len;
+            pkthdr.orig_len = total_len;
 
             capFile.write((uint8_t*)&pkthdr, sizeof(pcaprec_hdr_t));
-            capFile.write(payload, len);
+            capFile.write(rtap, sizeof(rtap));
+            capFile.write(payload, frame_len);
+            capFile.write((uint8_t*)&fcs, 4);
             capFile.flush();
         }
 
@@ -444,7 +515,7 @@ void IRAM_ATTR wifiSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) 
             Serial.print(">>> EAPOL #");
             Serial.print(eapolCounter);
             Serial.print(" | Len: ");
-            Serial.print(len);
+            Serial.print(frame_len);
             Serial.print(" | BSSID: ");
             for (int i = 0; i < 6; i++) {
                 if (bssid[i] < 0x10) Serial.print("0");
